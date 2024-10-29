@@ -3,7 +3,6 @@ import time
 import yt_dlp
 import whisper
 from transformers import pipeline
-from googletrans import Translator
 import warnings
 import re
 import math
@@ -21,8 +20,7 @@ def retry(func, max_attempts=3, wait_time=5, *args, **kwargs):
     attempt = 0
     while attempt < max_attempts:
         try:
-            result = func(*args, **kwargs)
-            return result, None  # Return the result and no error
+            return func(*args, **kwargs)
         except Exception as e:
             print(f"Attempt {attempt + 1} failed: {e}")
             attempt += 1
@@ -31,7 +29,13 @@ def retry(func, max_attempts=3, wait_time=5, *args, **kwargs):
                 time.sleep(wait_time)
             else:
                 print("All attempts failed.")
-                return None, e  # Return None and the error
+                return None
+
+# Helper Function: Sanitize filename by removing/replacing special characters
+def sanitize_filename(filename):
+    filename = re.sub(r'[<>:"/\\|?*]', '', filename)  # removes problematic characters
+    filename = filename.replace("：", "")  # specifically remove the full-width colon
+    return filename
 
 # Helper Function: Check audio quality (basic volume threshold)
 def check_audio_quality(audio_path, threshold=0.01):
@@ -45,18 +49,18 @@ def check_audio_quality(audio_path, threshold=0.01):
 # Helper Function: Validate YouTube URL
 def is_valid_youtube_url(url):
     youtube_regex = (
-        r'(https?://)?(www\\.)?'
-        '(youtube\\.com/watch\\?v=|youtu\\.be/)([a-zA-Z0-9_-]{11})'
+        r'(https?://)?(www\.)?'
+        '(youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})'
     )
     return re.match(youtube_regex, url) is not None
 
-# Step 1: Download audio from YouTube with fixed filename and ext handling
+# Step 1: Download audio from YouTube with sanitized filename
 def download_audio(youtube_url):
     try:
         print("Downloading audio from YouTube...")
         ydl_opts = {
             'format': 'bestaudio/best',
-            'outtmpl': os.path.join(audio_folder, 'audio.%(ext)s'),  # Simplified template with extension
+            'outtmpl': os.path.join(audio_folder, 'audio.wav'),  # Use a fixed filename
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'wav',
@@ -65,12 +69,11 @@ def download_audio(youtube_url):
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(youtube_url, download=True)
-            audio_path = os.path.join(audio_folder, 'audio.wav')  # Expected final output
-            print("Audio downloaded and saved as:", audio_path)
-            return audio_path  # Return only the audio path
+            print("Audio downloaded and saved as:", os.path.join(audio_folder, 'audio.wav'))
+            return os.path.join(audio_folder, 'audio.wav'), info['id']
     except Exception as e:
         print(f"Error downloading audio: {e}")
-        return None  # Return None if download fails
+        return None, None
 
 # Step 2: Check audio duration and optionally split if too long
 def split_long_audio(audio_path, max_duration=600):
@@ -96,6 +99,7 @@ def transcribe_audio_with_eta(audio_path):
     print("Transcribing audio... This may take a few minutes.")
     model = whisper.load_model("medium").to("cuda")  # Ensure GPU usage
     start_time = time.time()
+    # Transcribe
     result = model.transcribe(audio_path)
     end_time = time.time()
     actual_time = end_time - start_time
@@ -114,56 +118,59 @@ def clean_text(text):
         print(f"Error cleaning text: {e}")
         return text
 
-# Step 5: Translate text
-def translate_text(text):
-    try:
-        print("Translating text to English...")
-        translator = Translator()
-        translation = translator.translate(text, src='tr', dest='en')
-        print("Translation completed!")
-        return translation.text
-    except Exception as e:
-        print(f"Error during translation: {e}")
-        return None
-
 # Main function to process YouTube video
 def process_youtube_video(youtube_url):
     start_time = time.time()
+    # Step 1: Validate YouTube URL
     if not is_valid_youtube_url(youtube_url):
         print("Error: Invalid YouTube URL. Please provide a valid link.")
         return
-
-    audio_file = retry(download_audio, 3, 5, youtube_url)[0]  # Get the first element, which is the audio file
+    # Step 2: Download audio
+    audio_file, video_id = retry(download_audio, 3, 5, youtube_url)
     if audio_file is None:
         print("Exiting process due to download error.")
         return
-
+    # Wait for user confirmation to proceed to next step
     input("Audio downloaded successfully. Press Enter to proceed to audio quality check...")
+    # Step 3: Check audio quality and duration
     check_audio_quality(audio_file)
     audio_segments = split_long_audio(audio_file)
+    # Wait for user confirmation to proceed to transcription
     input("Audio quality checked. Press Enter to proceed to transcription...")
-
+    # Step 4: Transcribe each audio segment
     full_transcript = ""
     for segment in audio_segments:
-        transcript, error = retry(transcribe_audio_with_eta, 3, 5, segment)
+        transcript = retry(transcribe_audio_with_eta, 3, 5, segment)
         if transcript is None:
-            print(f"Exiting process due to transcription error: {error}")
+            print("Exiting process due to transcription error.")
             return
-        full_transcript += transcript + "\\n"
-
+        full_transcript += transcript + "\n"
+    # Wait for user confirmation to proceed to text cleaning
     input("Transcription completed. Press Enter to proceed to text cleaning...")
-    cleaned_text, error = retry(clean_text, 3, 5, full_transcript)
-
+    # Step 5: Clean transcript text
+    cleaned_text = retry(clean_text, 3, 5, full_transcript)
+    # Save the cleaned transcript
     try:
-        with open(os.path.join(audio_folder, "transcript.txt"), "w", encoding="utf-8") as f:
+        transcript_file = os.path.join(audio_folder, 'transcript.txt')
+        with open(transcript_file, "w", encoding="utf-8") as f:
             f.write(full_transcript)
-        print("Transcript saved as 'transcript.txt'")
+        print(f"Transcript saved as '{transcript_file}'")
     except Exception as e:
         print(f"Error saving transcript file: {e}")
 
-    end_time = time.time()
-    print(f"Text cleaned. Total time taken: {round(end_time - start_time, 2)} seconds")
+    # Save cleaned transcript
+    try:
+        cleaned_transcript_file = os.path.join(audio_folder, 'cleaned_transcript.txt')
+        with open(cleaned_transcript_file, "w", encoding="utf-8") as f:
+            f.write(cleaned_text)
+        print(f"Cleaned transcript saved as '{cleaned_transcript_file}'")
+    except Exception as e:
+        print(f"Error saving cleaned transcript file: {e}")
 
-# Example usage
+    # Display total time taken
+    end_time = time.time()
+    print(f"Total time taken: {round(end_time - start_time, 2)} seconds")
+
+# Example usage:
 youtube_url = input("Enter the YouTube URL: ")
 process_youtube_video(youtube_url)
